@@ -1,20 +1,23 @@
 
 import { Buffer } from 'node:buffer';
-import { useState, useEffect, useDisposableEffect, onCleanup, untrack, useMemo, createContext, useContext, getActiveWindow, setActiveWindow, processWorkQueue, getActiveNode, runInNode } from './state.js';
+import { useState, useEffect, useDisposableEffect, onCleanup, untrack, useMemo, createContext, useContext, getActiveWindow, setActiveWindow, processWorkQueue, getActiveNode, runInNode, useCallback } from './state.js';
 import { clientFunctionDefinitions, streamBlockTemplateInstall } from '../declare.js';
-import { build } from '../build.js';
 import { bufferPool, PAGE_SIZE } from '../buffer-pool.js';
 import { windowManager } from './window_manager.js';
-import { ErrorViewer, ErrorHandler } from './errors.js';
+import { ErrorHandler } from './errors.js';
 
 
 // set max input event buffer size to 1KB
 const MAX_INPUT_EVENT_BUFFER_SIZE = process.env.MAX_INPUT_EVENT_BUFFER_SIZE ? parseInt(process.env.MAX_INPUT_EVENT_BUFFER_SIZE) : 1024;
 
-export const WindowContext = createContext(null);
+const ClientContext = createContext(null);
 
 export function useWindow() {
-  return useContext(WindowContext);
+  return useClient();
+}
+
+export function useClient() {
+  return useContext(ClientContext);
 }
 
 const camelCaseToKebabCaseRegex = /([a-z0-9])([A-Z])/g;
@@ -116,8 +119,6 @@ class WorkQueue {
   }
 }
 
-
-
 function processInput(window, inputQueue) {
 
   setActiveWindow(window);
@@ -137,19 +138,32 @@ function processInput(window, inputQueue) {
   setActiveWindow(null);
 }
 
+function createNoArgHandler(fn) {
+  return $c(() => {
+    $s(fn)();
+  });
+}
+
+let navigateClientFn = $c((path) => {
+  window.history.pushState({}, '', path);
+});
+
+let cookieSetClientFn = $c((cookieString) => {
+  document.cookie = cookieString;
+});
+
 //let CMD_PING = 0;
 //let CMD_INSTALL_TEMPLATE = 1;
 let CMD_INIT_WINDOW = 2;
 let CMD_ATTACH_ANCHOR = 3;
-let CMD_COOKIE_SET = 4;
 let CMD_ATTACH_EVENT_V2 = 5;
-let CMD_NAV = 6;
 let CMD_ELEMENT_UPDATE = 7;
 let CMD_INIT_BLOCK = 8;
 let CMD_REMOVE_BLOCKS = 9;
 let CMD_INSTALL_CLIENT_FUNCTION = 10;
 let CMD_RUN_CLIENT_FUNCTION = 11;
 let CMD_INIT_SEQUENCE = 13;
+let CMD_MODIFY_SEQUENCE = 14;
 
 let pingBuffer = Buffer.from([0]);
 const multiStylePropScratchBuffer = Buffer.alloc(32768);
@@ -210,8 +224,9 @@ export class Window {
 
     this.lastPongTime = Date.now();
 
-    let windowContext = {
+    let clientContext = {
       viewportSize: viewportSizeSignal,
+
       cookie: (cookieKey) => {
         return useMemo(() => {
           let cookieString = getCookie();
@@ -227,23 +242,31 @@ export class Window {
 
           setCookie(newCookieString);
 
-          this._streamClientCookieUpdateCommand(cookieKey, cookieValue, expirationTime);
+          if (!expirationTime) {
+            expirationTime = new Date();
+            // set default expiration to one hour after now
+            expirationTime.setHours(expirationTime.getHours() + 1);
+          }
+
+          // build the cookie string
+          let cookieSetString = `${cookieKey}=${cookieValue}; expires=${expirationTime.toUTCString()}; path=/`;
+
+          clientContext.exec(cookieSetClientFn, [cookieSetString]);
         });
       },
 
       path,
 
       navigate: (path) => {
-        let buf = this._allocCommandBuffer(1 + 2 + path.length);
-        buf.writeUint8(CMD_NAV, 0);
-        buf.writeUint16BE(path.length, 1);
-        buf.write(path, 1 + 2);
-
+        clientContext.exec(navigateClientFn, [path]);
         setPath(path);
       },
 
       clientExec: (clientFnSpec, args) => {
+        clientContext.exec(clientFnSpec, args);
+      },
 
+      exec: (clientFnSpec, args) => {
         let eventHandlerIds = [];
         let { clientFnId, serverBindFns } = clientFnSpec;
 
@@ -287,16 +310,7 @@ export class Window {
 
     this.rootDisposer = useDisposableEffect(() => {
 
-      if (build.syntaxErrors) {
-        let fileName = Object.keys(build.syntaxErrors)[0];
-        let err = build.syntaxErrors[fileName];
-        let stack = [err];
-
-        this._attach(2, 0, <ErrorViewer name={err.name} message={err.message} stack={stack} />);
-        return;
-      }
-
-      getActiveNode().context = { [WindowContext.id]: windowContext };
+      getActiveNode().context = { [ClientContext.id]: clientContext };
 
       this._attach(1, 0, <components.Head />);
       this._attach(2, 0,
@@ -331,7 +345,6 @@ export class Window {
     // later, we'll need to check if there's still work to do since we'll only be allowed to do a certain amount of work per frame
     this.hasPendingWork = false;
   }
-
 
   sendPing() {
     this.port.send(pingBuffer);
@@ -579,6 +592,10 @@ export class Window {
         page,
         pageStartOffset: this.global_writeOffset,
       };
+
+      setImmediate(() => {
+        this._flushMutationGroup();
+      });
     }
 
     let mg = this.mutationGroup;
@@ -674,26 +691,6 @@ export class Window {
     }
   }
 
-  _streamClientCookieUpdateCommand(cookieKey, cookieValue, expirationTime) {
-
-    if (!expirationTime) {
-      expirationTime = new Date();
-      // set default expiration to one hour after now
-      expirationTime.setHours(expirationTime.getHours() + 1);
-    }
-
-    // build the cookie string
-    let cookieSetString = `${cookieKey}=${cookieValue}; expires=${expirationTime.toUTCString()}; path=/`;
-
-    let buf = this._allocCommandBuffer(1 + 2 + cookieSetString.length);
-
-    buf.writeUInt8(CMD_COOKIE_SET, 0);
-    buf.writeUInt16BE(cookieSetString.length, 1);
-    buf.write(cookieSetString, 3);
-
-    // TODO: add ability to set server-only cookies
-  }
-
   _createBlockId() {
     this.latestBlockId++;
 
@@ -706,51 +703,6 @@ export class Window {
     buf.writeUint8(CMD_INIT_BLOCK, 0);
     buf.writeUint16BE(blockId, 1);
     buf.writeUint16BE(blockTemplateIds, 3);
-  }
-
-  _attach(blockId, anchorIndex, nodeResult) {
-    if (typeof nodeResult == 'string') {
-      this._streamTextInitCommand(blockId, anchorIndex, nodeResult);
-    } else if (typeof nodeResult == 'number') {
-      this._streamTextInitCommand(blockId, anchorIndex, nodeResult.toString());
-    } else if (!nodeResult) {
-      this._streamTextInitCommand(blockId, anchorIndex, '');
-    } else {
-      switch (nodeResult.constructor) {
-        case Block:
-          this._streamAttachBlockCommand(blockId, anchorIndex, nodeResult.id);
-          break;
-        case Component:
-          useEffect(() => {
-            this._attach(blockId, anchorIndex, nodeResult.fn(nodeResult.props));
-          });
-          break;
-        /*
-        case Promise:
-          let node = getActiveNode();
- 
-          nodeResult.then(value => {
-            runInNode(node, () => {
-              this._attach(blockId, anchorIndex, value);
-            });
-          }).catch(err => {
-            console.error(err);
-          });
-          break;
-        */
-        case Function:
-          useEffect(() => {
-            let value = nodeResult();
-            this._attach(blockId, anchorIndex, value);
-          });
-          break;
-        case Array:
-          this._attachListV2(blockId, anchorIndex, nodeResult);
-          break;
-        default:
-          console.error('Unknown nodeResult', nodeResult);
-      }
-    }
   }
 
   _createSequence(listLength) {
@@ -771,17 +723,6 @@ export class Window {
     });
 
     return _seqId;
-  }
-
-  _attachListV2(blockId, anchorIndex, list) {
-
-    let _seqId = this._createSequence(list.length);
-
-    this._streamAttachBlockCommand(blockId, anchorIndex, _seqId);
-
-    for (let i = 0; i < list.length; i++) {
-      this._attach(_seqId, i, list[i]);
-    }
   }
 
   _streamTextInitCommand(blockId, anchorIndex, value) {
@@ -856,24 +797,24 @@ export class Window {
 
   _handleBlockEventHandlers(newBlockId, eventHandlers) {
     let eventHandlerIds = [];
+    let eventHandlersCount = eventHandlers.length;
 
-    eventHandlers.forEach((eventHandler, index) => {
+    for (let i = 0; i < eventHandlersCount; i++) {
+      let eventHandler = eventHandlers[i];
       let clientFnId;
       let serverBindFns;
 
       // do nothing if the event handler is undefined
       if (!eventHandler.fn) {
-        return;
+        continue;
       } else if (eventHandler.fn instanceof Function) {
-        // if the event handler is not yet a client function, 
-        // assign a built-in client function id of 1, 
-        // which is a function that calls the server function without any argument.
-        //
-        // TODO: this is perfect for event types like "click",
-        // but not for event types like "change" which requires an argument.
-        // assign a different built-in client function id for event types that naturally require an argument?
-        clientFnId = 1;
-        serverBindFns = [eventHandler.fn];
+        let eventHandlerFn = createNoArgHandler(eventHandler.fn);
+
+        // if the event handler is just a function instance, 
+        // assign a client function that wraps the event handler
+        // and calls it directly without arguments
+        clientFnId = eventHandlerFn.clientFnId;
+        serverBindFns = eventHandlerFn.serverBindFns;
       } else if (eventHandler.fn.clientFnId) {
         clientFnId = eventHandler.fn.clientFnId;
         serverBindFns = eventHandler.fn.serverBindFns || [];
@@ -887,7 +828,7 @@ export class Window {
 
       this._streamFunctionInstallCommand(clientFnId);
       this._streamEventInitCommandV2(newBlockId, eventHandler.targetId, eventHandler.type, clientFnId, serverBindIds);
-    });
+    }
 
     onCleanup(() => {
       this._deallocateEventHandlers(eventHandlerIds);
@@ -1075,6 +1016,221 @@ export class Window {
     buf.writeUint8(tokenLength, 1);
     buf.write(tokenName, 2, tokenLength);
     buf.writeUint8(0, 2 + tokenLength);
+  }
+
+  _attach(blockId, anchorIndex, nodeResult) {
+    if (typeof nodeResult == 'string') {
+      this._streamTextInitCommand(blockId, anchorIndex, nodeResult);
+    } else if (typeof nodeResult == 'number') {
+      this._streamTextInitCommand(blockId, anchorIndex, nodeResult.toString());
+    } else if (!nodeResult) {
+      this._streamTextInitCommand(blockId, anchorIndex, '');
+    } else {
+      switch (nodeResult.constructor) {
+        case Block:
+          this._streamAttachBlockCommand(blockId, anchorIndex, nodeResult.id);
+          break;
+        case Component:
+          useEffect(() => {
+            this._attach(blockId, anchorIndex, nodeResult.fn(nodeResult.props));
+          });
+          break;
+        case Function:
+          useEffect(() => {
+            let value = nodeResult();
+            this._attach(blockId, anchorIndex, value);
+          });
+          break;
+        case Array:
+          this._attachListV2(blockId, anchorIndex, nodeResult);
+          break;
+        case StreamView:
+          this._attachStreamView(blockId, anchorIndex, nodeResult);
+          break;
+        /*
+       case Promise:
+         let node = getActiveNode();
+ 
+         nodeResult.then(value => {
+           runInNode(node, () => {
+             this._attach(blockId, anchorIndex, value);
+           });
+         }).catch(err => {
+           console.error(err);
+         });
+         break;
+       */
+        default:
+          console.error('Unknown nodeResult', nodeResult);
+      }
+    }
+  }
+
+  _attachListV2(blockId, anchorIndex, list) {
+
+    let _seqId = this._createSequence(list.length);
+
+    this._streamAttachBlockCommand(blockId, anchorIndex, _seqId);
+
+    for (let i = 0; i < list.length; i++) {
+      this._attach(_seqId, i, list[i]);
+    }
+  }
+
+  _attachStreamView(blockId, anchorIndex, streamView) {
+    let disposeFns = [];
+    let itemIds = [];
+    let _lastItemId = 0;
+
+    let _seqId = this._createSequence(0);
+
+    // attach the sequence to the anchor
+    this._streamAttachBlockCommand(blockId, anchorIndex, _seqId);
+
+    function assignItemId(startIndex) {
+      let itemId = ++_lastItemId;
+      itemIds.splice(startIndex, 0, itemId);
+      return itemId;
+    }
+
+    function getIndexForItemId(itemId) {
+      // use better data structure for this
+      return itemIds.indexOf(itemId);
+    }
+
+    let initializeItemComponents = (startIndex, itemCount) => {
+      // attach initial items
+      for (let i = 0; i < itemCount; i++) {
+        let itemId = assignItemId(startIndex + i);
+
+        let disposeFn = useDisposableEffect(() => {
+          let currentIndexForItemId = getIndexForItemId(itemId);
+
+          this._attach(_seqId, currentIndexForItemId, streamView.renderNode(currentIndexForItemId));
+        });
+
+        // insert the dispose function at the correct index
+        disposeFns.splice(startIndex + i, 0, disposeFn);
+      }
+    }
+
+    streamView.onChange(useCallback(change => {
+      let startIndex = change.index;
+      let count = change.count;
+
+      // modify the sequence
+      this._streamModifySequenceCommand(_seqId, change.type, startIndex, count);
+
+      if (change.type == MODIFY_REMOVE) {
+        // dispose the nodes
+        for (let i = 0; i < count; i++) {
+          disposeFns[startIndex + i]();
+        }
+
+        // remove the dispose functions
+        disposeFns.splice(startIndex, count);
+
+      } else { // if (change.type == MODIFY_INSERT) 
+        initializeItemComponents(startIndex, count);
+      }
+    }));
+  }
+
+  _streamModifySequenceCommand(seqId, changeType, arg0, arg1) {
+    let buf = this._allocCommandBuffer(1 + 2 + 1 + 2 + 2);
+
+    // CMD_MODIFY_SEQUENCE
+    // seqId
+    // changeType (append, prepend, insert, remove, reset)
+    // arg0: index
+    // arg1: count
+    buf.writeUInt8(CMD_MODIFY_SEQUENCE, 0);
+    buf.writeUInt16BE(seqId, 1);
+    buf.writeUInt8(changeType, 3);
+    buf.writeUInt16BE(arg0, 4);
+    buf.writeUInt16BE(arg1, 6);
+  }
+}
+
+const MODIFY_INSERT = 3;
+const MODIFY_REMOVE = 4;
+
+export function useStream(initialItems) {
+  return new Stream(initialItems);
+}
+
+class Stream {
+
+  constructor(items) {
+    this.items = items;
+    this.views = [];
+  }
+
+  indexOf(item) {
+    return this.items.indexOf(item);
+  }
+
+  remove(index, count) {
+    this.items.splice(index, count);
+
+    this.views.forEach(view => {
+      view.notifyRemoval(index, count);
+    });
+  }
+
+  unshift(...items) {
+    this.items.unshift(...items);
+
+    this.views.forEach(view => {
+      view.notifyInsert(0, items.length);
+    });
+  }
+
+  push(...items) {
+    let index = this.items.length;
+
+    this.items.push(...items);
+
+    this.views.forEach(view => {
+      view.notifyInsert(index, items.length);
+    });
+  }
+
+  view(fn) {
+    let view = new StreamView(index => fn(this.items[index]), this.items.length);
+
+    this.views.push(view);
+
+    onCleanup(() => {
+      let index = this.views.indexOf(view);
+      this.views.splice(index, 1);
+    });
+
+    return view;
+  }
+};
+
+class StreamView {
+  constructor(fn, initialCount) {
+    this.renderNode = fn;
+    this.onChangeFn = null;
+    this.initialCount = initialCount;
+  }
+
+  onChange(fn) {
+    this.onChangeFn = fn;
+
+    if (this.initialCount > 0) {
+      this.notifyInsert(0, this.initialCount);
+    }
+  }
+
+  notifyRemoval(index, count) {
+    this.onChangeFn({ type: MODIFY_REMOVE, index, count });
+  }
+
+  notifyInsert(index, count) {
+    this.onChangeFn({ type: MODIFY_INSERT, index, count });
   }
 }
 
