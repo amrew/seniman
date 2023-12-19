@@ -1,6 +1,28 @@
-## Express SQLite Example
+# express-sqlite
 
-To run the application:
-- Run `npm install` to install dependencies
-- Run `npm run dev` to start the development server (with auto-reloading)
-- Open [http://localhost:3002](http://localhost:3002) to view the application
+In this example, we'll show a simple Todo app using Seniman and SQLite.
+
+## Prerequisites
+
+- Node.js 16+
+
+## Installation
+
+Run the following command to install the dependencies:
+
+```bash
+npm install
+```
+
+## Development
+
+Run the following command to compile the app (with watch enabled):
+```bash
+npx babel src --out-dir dist --watch
+```
+
+And then the following command on another terminal to start the development server:
+
+```bash
+npx nodemon dist/index.js
+```

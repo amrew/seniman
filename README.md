@@ -4,6 +4,9 @@ Seniman is a JavaScript server-driven UI framework that runs your JSX components
 
 Seniman synchronizes the latest UI server state with the browser using custom binary protocol over WebSocket and a thin ~3KB browser runtime, allowing fast-loading, low-latency user interfaces. 
 
+Try the live demo at our docs site built completely with Seniman at https://senimanjs.org. 
+
+
 ```js
 import { useState } from "seniman";
 
@@ -17,9 +20,11 @@ function Counter(props) {
   </div>;
 }
 ```
-Seniman runs on Node.JS and uses familiar JSX syntax & state management APIs, so you can hit the ground running.
+The entire `Counter` component -- including the `onClick` handler -- runs on the server. Seniman runs on Node.JS and uses familiar JSX syntax & state management APIs, so you can hit the ground running.
 
-##### Note: Seniman is alpha software. The API is unstable and may change in the future. Please use with caution.
+Tweet thread explaining the motivation and general architecture here: https://twitter.com/senimanjs/status/1630888630905606144
+
+Example applications are available at the [examples](examples/) folder.
 
 ## Table of Contents
 - [How it Works](#how-it-works)
@@ -33,9 +38,9 @@ At a high-level, the Seniman runtime is divided into the server and client-side 
 
 ![Seniman Architecture](images/architecture.png)
 
-On the server-side, Seniman includes a custom runtime to build and maintain your UI component tree, track state changes across components, and manage connections to concurrently-connected browser windows. The server-side runtime is also responsible for generating UI update commands to make sure the browser is able to render the latest UI state. Event system is also implemented on the server-side -- allowing your server-side code to respond to events triggered by the client.
+Seniman's server-side includes a custom runtime that manages the lifecycle of your JSX component tree, tracks state changes, and handles connections to multiple browser windows. It generates UI update commands to ensure the latest state is rendered in the browser, and also implements a remote event system to allow server-side code to react to client-triggered events.
 
-In order to achieve network efficiency, Seniman server communicates with the client by sending commands using a custom binary protocol over WebSocket, which are then interpreted into actual DOM operations by a ~3kb browser runtime. The result is a low-latency, fast-loading, remotely-driven user interface that feels local over a normal 4G connection.
+To optimize network efficiency, Seniman's server communicates with clients using a custom binary protocol over WebSocket. A lightweight (~3kb) browser runtime interprets these commands into actual DOM operations. The result is a low-latency, quick-loading, remotely-driven user interface that feels local even on a standard 4G connection.
 
 ## Installation
 
@@ -49,7 +54,7 @@ npm install seniman
 And the following for the Babel packages:
 
 ```sh
-npm install --save-dev @babel/cli babel-plugin-seniman 
+npm install --save-dev @babel/cli @babel/plugin-syntax-jsx
 ```
 
 ##### Note: Seniman supports Node.JS v16 or above.
@@ -84,21 +89,21 @@ server.listen(3002);
 
 ```
 
-To set up Seniman, you need to configure Babel to use the Seniman plugin. You can do this by adding the following to your `babel.config.json` file:
+To set up Seniman, you need to configure Babel to use Seniman's internal Babel plugin. You can do this by adding the following to your `babel.config.json` file:
 
 ```json
 {
-  "plugins": ["seniman"]
+  "plugins": ["seniman/babel"]
 }
 ```
 
 Then, you can run the babel compiler-watcher by running `babel` through `npx`:
 
 ```sh
-npx babel src --out-dir dist --watch
+npx babel src --out-dir dist
 ```
 
-This will watch your `src` directory for changes, and compile them to the `dist` directory. You can then run your code using Node.js:
+This will compile the code in `src` to the `dist` directory. You can then run your code using Node.js:
 
 ```sh
 node dist/index.js
@@ -110,9 +115,9 @@ Open up your browser and navigate to `http://localhost:3002`, and you should see
 
 ### What happens when the user clicks a button? How does the server know what to update?
 
-When the user clicks the button, the browser runtime will send a `click` event to the server. The server will then execute the `onClick` handler assigned to the element, which will update the UI state, depending on your logic. If there is any change to the UI state, the server will generate a set of DOM operations to update the UI, and send it to the client. The client will then execute the DOM operations, updating the UI. 
+When the user clicks the button, the browser runtime will send a `click` event to the server. The server will then execute the `onClick` handler assigned to the element's live representation on the server, which will then update the UI state, depending on your logic. If there is any change to the UI state, the server will generate a set of DOM operations to update the UI and send it to the client. The client will then apply the DOM operations, updating the UI. 
 
-This might sound slow, but in most cases, 4G connections are now low-latency enough for the users to not notice the delay. In addition, Seniman is designed to be efficient in terms of network usage -- only the necessary DOM operations are sent to the client. You can feel the latency for yourself, live at our docs page: [senimanjs.org](https://senimanjs.org/), and decide if it is acceptable for your use case.
+This round trip might sound slow, but in most cases, 4G connections are now low-latency enough for the users to not notice the delay. In addition, Seniman is designed to be efficient in terms of network usage -- only the necessary DOM operations are sent to the client. You can feel the latency for yourself, live at our docs page: [senimanjs.org](https://senimanjs.org/), and decide if it is acceptable for your use case.
 
 ### This looks pretty stateful -- what happens when a client loses its connection to the server, or a server goes down?
 
@@ -120,11 +125,19 @@ Seniman is designed to be resilient to network failures. When a client loses its
 
 When a server goes down, the client will similarly automatically reconnect to a different server in the cluster -- albeit restarting the session and losing any state that is not persisted to a database. If there is any important UI state you cannot afford to lose to a server crash -- say, a long, multi-page form -- you can persist the draft state to a database and re-load it when the client reconnects to a different window.
 
+### What happens to the components running on the server when the user loses its connection to the server? 
+
+By default, there is a grace period (of one minute) when Seniman will keep your component tree in memory while the browser tab's WebSocket connection is disconnected for unreliable network reasons.
+
+When the user connects back within the grace period, there will be re-pairing of the new WebSocket connection to the existing tree, and any UI updates queued during the disconnection will be sent to the browser and executed.
+
+When the user connects back after the grace period, a new component tree will be created for the user, and the existing tab will be reloaded to render the new component tree from a fresh state. There will be APIs in the future for you to choose the specific upon-late-reconnection behavior other than reloading to create a smoother experience for your users.
+
 ### This looks pretty stateful -- do I get to deploy this normally? How do I scale it up?
 
 Seniman can be deployed like any other Node.JS application. You can use a process manager like PM2 to manage your Seniman processes, and a reverse proxy like Nginx to horizontally-scale your Seniman app instances.
 
-In order for your users to have better experience during network reconnection, however, it is recommended to set up client-IP sticky sessions in your reverse proxy. This will help ensure that a client that has disconnected, will reconnect to the same server instance when it comes back online, allowing the client to resume its session without losing any state.
+In order for your users to have better experience during network reconnection, however, it is helpful to set up client-IP sticky sessions in your reverse proxy. This will help ensure that a client that has disconnected will reconnect to the same server instance when it comes back online, allowing the client to resume its session without losing any state, leading to a smoother user experience.
 
 ### Is my actual component code downloaded to the client?
 
@@ -132,7 +145,7 @@ No, only the resulting DOM operations are sent to the client -- your component c
 
 ### I have some logic I need running on the client. How do I do that?
 
-While most UI patterns are entirely implementable server-side with Seniman, Seniman also supports running custom logic on the client. Things that naturally need to run on the client like Google Single Sign-On, or custom analytics can be implemented using the `$c` and `$s` syntax.
+While most UI patterns are entirely implementable server-side with Seniman, Seniman also supports running custom logic on the client. Things that naturally need to run on the client like Google Single Sign-On, or custom analytics can be implemented using the `$c` and `$s` syntax -- explained in [this](https://senimanjs.org/docs/client-functions) docs page.
 
 ### Any example of this framework running somewhere? I want to see how a remotely-driven UI feels like.
 
@@ -143,4 +156,7 @@ Yes -- the documentation site for Seniman is built using Seniman itself! You can
 Some early users are using TypeScript to build with Seniman -- official support coming soon!
 
 ### How about SEO support?
-We'll soon be adding a separate HTML renderer that can be activated specifically for crawler requests, rendering the same JSX tree.
+There is a separate HTML renderer that can be activated specifically when a request is coming from a search engine crawler. This will allow you to implement SEO support for your Seniman app. We're already using this for our docs site at senimanjs.org -- documentation will also be coming soon!
+
+### Is this production ready?
+Not yet, but APIs are starting to stabilize and are already in active use in internal projects of some of our users.
